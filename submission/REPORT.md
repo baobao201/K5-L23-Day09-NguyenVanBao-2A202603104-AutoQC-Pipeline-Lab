@@ -51,7 +51,17 @@ Precision 100% của trùng gần ở ngưỡng 4 chỉ dựa trên **4 cờ đ�
 
 ## 5. Train raw và clean
 
-**Chưa chạy** vì phạm vi bài làm chỉ gồm phần bắt buộc. Chưa có số liệu mAP để so sánh.
+Chạy YOLO26n trong `.venv` trên GTX 1650 4 GB với Ultralytics 8.4.214 và PyTorch 2.7.1+cu126. Cả hai biến thể dùng cùng trọng số khởi tạo, 20 epoch, seed 0 và 1, ảnh 416 px, batch 8 và cùng tập validation 40 ảnh. Script chọn checkpoint theo validation rồi đo trên cùng 100 ảnh test. Ultralytics tự loại 11 ảnh hoặc nhãn lỗi trong `raw`, nên 224 ảnh đầu vào tương ứng 213 ảnh thực dùng. `clean` dùng đủ 205 ảnh.
+
+| Biến thể | Ảnh train đầu vào | Số seed | mAP50 (TB ± độ lệch) | mAP50–95 | Precision | Recall |
+|---|---:|---:|---:|---:|---:|---:|
+| raw | 224 | 2 | 0,577 ± 0,001 | 0,392 ± 0,005 | 0,708 ± 0,023 | 0,494 ± 0,017 |
+| clean | 205 | 2 | 0,622 ± 0,016 | 0,437 ± 0,007 | 0,773 ± 0,002 | 0,506 ± 0,014 |
+
+**mAP50 tăng 4,46 điểm phần trăm** với `clean` trên tập test này. Hai chênh lệch theo seed là +5,71 và +3,21 điểm phần trăm. Mức tăng trung bình lớn hơn độ lệch chuẩn giữa seed của cả `raw` (0,13 điểm phần trăm) và `clean` (1,64 điểm phần trăm). Kết quả nhất quán trong hai seed đã chạy. Cần thêm seed và tập test độc lập để kiểm tra khả năng tái lập. [Kết quả do script sinh](results/comparison.md)
+
+- **Ảnh trùng với tập test có thể làm điểm `raw` cao hơn.** Đối chiếu cửa vào với tập ảnh loader thực dùng cho thấy 4/100 ảnh test có bản gần trùng trong `raw` (pHash cách 0–2 bit), cả bốn đã bị loại khỏi `clean`. Có thể tách kết quả theo nhóm trùng và đánh giá lại trên tập test độc lập.
+- **Thay đổi thành phần ảnh và thay đổi nhãn đều có thể góp vào chênh lệch.** Loader dùng 213 ảnh `raw` so với 205 ảnh `clean`, đồng thời pipeline đã sửa cú pháp và thay nhãn cho 80 ảnh duyệt mô phỏng. Để đo riêng tác động của nhãn, có thể huấn luyện hai biến thể trên cùng tập ảnh hợp lệ, loại bản trùng và chỉ thay nhãn. [Nhật ký sửa](reports/03_fixes.csv) · [Nhật ký duyệt](reports/06_review_log.csv)
 
 ## 6. Quyết định và ghi chú AI
 
