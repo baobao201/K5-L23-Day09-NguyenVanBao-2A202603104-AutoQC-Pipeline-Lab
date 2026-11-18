@@ -35,10 +35,79 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    limits = cfg["second_opinion"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    issues = []
+    for path in ds.image_files():
+        stem = path.stem
+        if stem not in preds:
+            continue
+        lines = ds.read_label_lines(stem)
+        size = ds.image_size(stem)
+        if lines is None or size is None:
+            continue
+        width, height = size
+
+        labels = []
+        for line, text in lines:
+            try:
+                cls, *box = parse_yolo_line(text)
+            except (ValueError, OverflowError):
+                continue
+            if 0 <= cls < len(ds.classes):
+                labels.append((line, cls, box))
+
+        covered = set()
+        for cls, conf, *box in preds[stem]:
+            area = (box[2] * width) * (box[3] * height)
+            check_prediction = conf >= limits["conf"] and area >= limits["min_area_px"]
+            check_coverage = conf >= limits["fp_conf"]
+            if not (check_prediction or check_coverage):
+                continue
+
+            same_class, other_class = [], []
+            for line, label_cls, label_box in labels:
+                overlap = iou_xywh(box, label_box)
+                if overlap < limits["iou_missing"]:
+                    continue
+                if check_coverage:
+                    covered.add(line)
+                if label_cls == cls:
+                    same_class.append(overlap)
+                else:
+                    other_class.append(overlap)
+
+            if not check_prediction:
+                continue
+            extra = {"conf": conf, "model_class": cls, "box": box}
+            if not same_class and not other_class:
+                code = "POSSIBLE_MISSING"
+                message = f"model thấy {ds.classes[cls]} ở vùng chưa có nhãn khớp"
+            elif same_class:
+                best = max(same_class)
+                if best >= limits["iou_loose"]:
+                    continue
+                code = "POSSIBLE_LOOSE_BOX"
+                message = f"box cùng lớp lệch so với model (IoU {best:.3f})"
+                extra["iou"] = best
+            else:
+                best = max(other_class)
+                if best < limits["iou_match"]:
+                    continue
+                code = "POSSIBLE_WRONG_CLASS"
+                message = f"model dự đoán {ds.classes[cls]} tại box khác lớp (IoU {best:.3f})"
+                extra["iou"] = best
+            issues.append(Issue("second_opinion", WARN, code, stem, message, extra=extra))
+
+        for line, _, _ in labels:
+            if line not in covered:
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                                    "box nhãn không có dự đoán khớp", line))
+    return issues
