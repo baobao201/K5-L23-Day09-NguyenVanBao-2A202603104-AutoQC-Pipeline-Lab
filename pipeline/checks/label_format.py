@@ -21,9 +21,55 @@ Gợi ý
 - `iou_xywh(a, b)` có sẵn trong common.py.
 - Ngưỡng nằm trong `cfg["label_format"]` — đừng viết cứng số vào code.
 """
-from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
+from collections import defaultdict
+from math import isclose, ulp
+
+from ..common import ERROR, WARN, Issue, iou_xywh, parse_yolo_line
 
 
 def run(ds, cfg):
-    # TODO: duyệt từng file nhãn, từng dòng
-    raise NotImplementedError("check label_format chưa làm")
+    limits = cfg["label_format"]
+    overflow_tol = limits["overflow_tol"]
+    issues = []
+    for path in ds.label_files():
+        stem = path.stem
+        size = ds.image_size(stem)
+        previous = defaultdict(list)
+        for line, text in ds.read_label_lines(stem) or []:
+            try:
+                cls, x, y, w, h = parse_yolo_line(text)
+            except (ValueError, OverflowError) as exc:
+                issues.append(Issue("label_format", ERROR, "BAD_FORMAT", stem, str(exc), line))
+                continue
+            if not 0 <= cls < len(ds.classes):
+                issues.append(Issue("label_format", ERROR, "BAD_CLASS_ID", stem, f"ID lớp ngoài danh sách: {cls}", line))
+                continue
+            if w <= 0 or h <= 0:
+                issues.append(Issue("label_format", ERROR, "BOX_ZERO", stem, "chiều rộng hoặc chiều cao không dương", line))
+                continue
+
+            overflow = max(0.0, w / 2 - x, h / 2 - y, x + w / 2 - 1, y + h / 2 - 1)
+            # The edge calculation can introduce rounding at the tolerance boundary.
+            if overflow > overflow_tol and not isclose(overflow, overflow_tol, rel_tol=0, abs_tol=ulp(1.0)):
+                issues.append(Issue("label_format", ERROR, "BOX_OUT_OF_IMAGE", stem,
+                                    f"box tràn {overflow:.6g} theo tỉ lệ ảnh", line, {"overflow": overflow}))
+
+            box = (x, y, w, h)
+            for earlier_line, earlier_box in previous[cls]:
+                overlap = iou_xywh(box, earlier_box)
+                if overlap > limits["dup_box_iou"]:
+                    issues.append(Issue("label_format", ERROR, "DUP_BOX", stem,
+                                        f"box lặp với dòng {earlier_line} (IoU {overlap:.3f})", line,
+                                        {"of_line": earlier_line, "iou": overlap}))
+                    break
+            previous[cls].append((line, box))
+
+            if size is not None:
+                short_side = min(w * size[0], h * size[1])
+                if short_side < limits["min_box_px"]:
+                    issues.append(Issue("label_format", WARN, "BOX_TINY", stem,
+                                        f"cạnh ngắn {short_side:.2f} px", line))
+            if w * h > limits["max_box_frac"]:
+                issues.append(Issue("label_format", WARN, "BOX_HUGE", stem,
+                                    f"box chiếm {w * h:.1%} diện tích ảnh", line))
+    return issues
