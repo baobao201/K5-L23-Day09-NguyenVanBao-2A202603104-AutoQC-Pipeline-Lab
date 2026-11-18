@@ -27,13 +27,97 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, ROOT, parse_yolo_line
+
+DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_CODES = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _clip(text):
+    cls, x, y, w, h = parse_yolo_line(text)
+    left, right = max(0.0, x - w / 2), min(1.0, x + w / 2)
+    top, bottom = max(0.0, y - h / 2), min(1.0, y + h / 2)
+    if left >= right or top >= bottom:
+        return None
+    return f"{cls} {(left + right) / 2} {(top + bottom) / 2} {right - left} {bottom - top}"
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    if ds.root.resolve().is_relative_to((ROOT / "data/raw").resolve()):
+        raise ValueError("autofix cần bản sao làm việc của dữ liệu")
+
+    remove = set()
+    needs_label = set()
+    line_issues = defaultdict(lambda: defaultdict(set))
+    rename = False
+    for issue in issues:
+        if issue.severity != ERROR:
+            continue
+        if issue.code in REMOVE_CODES or issue.code.startswith("DUP_IMAGE_"):
+            remove.add(issue.image)
+        elif issue.code == "BAD_CLASS_NAME":
+            rename = True
+        elif issue.code == "MISSING_LABEL_FILE":
+            needs_label.add(issue.image)
+        elif issue.line is not None and (issue.code in DROP_CODES or issue.code == "BOX_OUT_OF_IMAGE"):
+            line_issues[issue.image][issue.line].add(issue.code)
+
+    fixes = []
+    if remove:
+        paths_by_stem = defaultdict(list)
+        for path in ds.image_files():
+            if path.stem in remove:
+                paths_by_stem[path.stem].append(path)
+        for stem in sorted(remove):
+            paths = paths_by_stem[stem]
+            label_path = ds.label_path(stem)
+            if label_path.exists():
+                paths.append(label_path)
+            if paths:
+                for path in paths:
+                    path.unlink()
+                fixes.append(dict(image=stem, line=None, action="remove_image",
+                                  before=", ".join(path.name for path in paths), after=""))
+
+    if rename:
+        data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) if ds.yaml_path.exists() else {}
+        data = data or {}
+        before = data.get("names")
+        classes = cfg["classes"]
+        if before != classes and before != dict(enumerate(classes)):
+            data["names"] = classes
+            ds.yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+                                    encoding="utf-8", newline="\n")
+            fixes.append(dict(image="data.yaml", line=None, action="rename_classes",
+                              before=repr(before), after=repr(classes)))
+
+    for stem in sorted(needs_label - remove):
+        if not ds.label_path(stem).exists():
+            fixes.append(dict(image=stem, line=None, action="needs_label",
+                              before="(không có file)", after="chuyển người gán"))
+
+    for stem in sorted(line_issues.keys() - remove):
+        path = ds.label_path(stem)
+        if not path.exists():
+            continue
+        kept = []
+        changes = []
+        for line, before in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            codes = line_issues[stem].get(line)
+            if not codes or not before.strip():
+                kept.append(before)
+                continue
+            after = None if DROP_CODES.intersection(codes) else _clip(before)
+            if after is not None:
+                kept.append(after)
+            if after != before:
+                changes.append(dict(image=stem, line=line, action="drop_line" if after is None else "clip_box",
+                                    before=before, after=after or ""))
+        if changes:
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8", newline="\n")
+            fixes.extend(changes)
+    return fixes
